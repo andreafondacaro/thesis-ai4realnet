@@ -18,7 +18,6 @@ def make_factored_binary_matrix(
       • Rows n_states..n_states+n_actions-1 = actions
       • Columns 0..n_states-1 = next states
 
-    Now supports arbitrary cluster (block) sizes via 'cluster_sizes'.
     Constraints:
       1) For each state row i, M[i, i] = 1.
       2) Each column j has at least one 1 in some action row.
@@ -37,46 +36,37 @@ def make_factored_binary_matrix(
     # --- Handle cluster_sizes / n_clusters ---
     if cluster_sizes is not None:
         cluster_sizes = list(cluster_sizes)
-        assert sum(cluster_sizes) == n_states, "Sum of cluster_sizes must equal n_states"
         n_clusters = len(cluster_sizes)
     else:
-        assert n_clusters is not None, "Provide either cluster_sizes or n_clusters"
-        assert n_states % n_clusters == 0, "For equal-size blocks, n_states must be divisible by n_clusters"
         block_size = n_states // n_clusters
         cluster_sizes = [block_size] * n_clusters
 
     n_clusters = len(cluster_sizes)
     n_rows = n_states + n_actions
 
-    # --- Build state_label based on cluster_sizes ---
     state_label = np.concatenate([
         np.full(sz, f, dtype=int) for f, sz in enumerate(cluster_sizes)
     ])
 
-    boundaries = np.concatenate(([0], np.cumsum(cluster_sizes)))  # length n_clusters+1
+    boundaries = np.concatenate(([0], np.cumsum(cluster_sizes)))
 
-    # --- Assign actions to clusters proportional to block size ---
-    # Larger state blocks get more actions.
-    # Compute quotas, then round and fix the total.
-    block_sizes_arr = np.array(cluster_sizes, dtype=float)
-    raw_quotas = block_sizes_arr * (n_actions / float(n_states))  # proportional
+    # Assign actions to clusters proportional to cluster size
+    cluster_sizes_arr = np.array(cluster_sizes, dtype=float)
+    raw_quotas = cluster_sizes_arr * (n_actions / float(n_states))
     base = np.floor(raw_quotas).astype(int)
     remaining = n_actions - base.sum()
-    # Distribute the remaining actions to blocks with largest fractional parts
     frac = raw_quotas - base
-    order = np.argsort(-frac)  # descending fractional part
+    order = np.argsort(-frac)
     for f in order[:remaining]:
         base[f] += 1
-    # base now sums to n_actions
 
-    # Build action_label: repeat factor index according to base[f]
+    # Build action_label: repeat cluster index according to base[f]
     action_label = []
     for f, count in enumerate(base):
         action_label.extend([f] * count)
     action_label = np.array(action_label, dtype=int)
     assert len(action_label) == n_actions
 
-    # --- Allocate M ---
     M = np.zeros((n_rows, n_states), dtype=int)
 
     #STATE rows: intra- & inter-cluster edges + forced diagonal ones
