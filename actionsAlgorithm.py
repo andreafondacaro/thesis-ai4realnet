@@ -14,6 +14,78 @@ def find_clusters(matrix):
         clusters.append((curr_cluster))
     return clusters
 
+def influence_fn(matrix, state, action):
+    """
+    Determines if action influences state based on matrix.
+
+    An action influences a state if matrix[state, action] == 1.
+    """
+    return matrix[action, state - matrix.shape[0]] == 1
+
+def _split_states_actions(cluster, n_rows, n_cols):
+    """
+    Given a cluster of global indices, split into state and action indices.
+
+    cluster: list[int]
+    n_states: int == matrix.shape[0]
+
+    Returns:
+        states: list[int]   # row indices
+        actions: list[int]  # column indices (0-based, no offset)
+    """
+    states = []
+    actions = []
+    for idx in cluster:
+        if idx > n_cols - 1 and idx < n_rows:
+            actions.append(idx)
+        elif idx >= n_rows:
+            states.append(idx)
+    return states, actions
+
+
+def build_dependencies(matrix, clusters):
+    """
+    Build a dependency graph between clusters based on influence_fn.
+
+    A cluster i depends on cluster j if there exists:
+        state in clusters[i], action in clusters[j]
+    such that influence_fn(matrix, state, action) is True.
+
+    Returns:
+        dependencies: dict[int, list[int]]  # adjacency list of cluster graph
+    """
+    n_clusters = len(clusters)
+
+    # Precompute states/actions per cluster
+    cluster_states = []
+    cluster_actions = []
+    for c in clusters:
+        s, a = _split_states_actions(c, matrix.shape[0], matrix.shape[1])
+        cluster_states.append(s)
+        cluster_actions.append(a)
+
+    dependencies = {i: [] for i in range(n_clusters)}
+
+    for i in range(n_clusters):
+        for j in range(n_clusters):
+            if i == j:
+                continue
+
+            # i depends on j if one of i's states is influenced by one of j's actions
+            depends = False
+            for s in cluster_states[i]:
+                for a in cluster_actions[j]:
+                    if influence_fn(matrix, s, a):
+                        depends = True
+                        break
+                if depends:
+                    break
+
+            if depends:
+                dependencies[i].append(j)
+
+    return dependencies
+
 def evaluate_matrix(matrix, row_indices, col_indices, shape, alpha=0.6):
 #computes scores for the 2 separate matrices and compares them to the full matrix
     full_score = 0
@@ -36,7 +108,68 @@ def evaluate_matrix(matrix, row_indices, col_indices, shape, alpha=0.6):
 
     return separate_score > full_score, full_score
 
-def merge_clusters(matrix, clusters, alpha, max_iter=None):
+def find_cycles_dfs(dependencies):
+    """
+    dependencies: dict[int, list[int]] adjacency list
+
+    Returns:
+        cycles: list[list[int]] where each list is a cycle of cluster indices
+    """
+    visited = set()
+    rec_stack = set()
+    parent = {}
+    cycles = []
+
+    def dfs(u):
+        visited.add(u)
+        rec_stack.add(u)
+
+        for v in dependencies.get(u, []):
+            if v not in visited:
+                parent[v] = u
+                dfs(v)
+            elif v in rec_stack:
+                # Found a cycle: extract it
+                cycle = [v]
+                x = u
+                while x != v:
+                    cycle.append(x)
+                    x = parent[x]
+                cycle.reverse()
+                cycles.append(cycle)
+
+        rec_stack.remove(u)
+
+    for node in dependencies.keys():
+        if node not in visited:
+            parent[node] = None
+            dfs(node)
+
+    return cycles
+
+def merge_cycles(clusters, cycles):
+    """
+    Merge all cycles into clusters.
+    cycles: list of lists of cluster indices
+    """
+    merged_sets = []  # final merged clusters
+    used = set()
+
+    for cycle in cycles:
+        merged = set()
+        for idx in cycle:
+            used.add(idx)
+            merged.update(clusters[idx])
+        merged_sets.append(sorted(merged))
+
+    # Add clusters not involved in any cycle
+    for i, c in enumerate(clusters):
+        if i not in used:
+            merged_sets.append(sorted(set(c)))
+
+    return merged_sets
+
+def merge_clusters(matrix, clusters, alpha):
     """
     Greedy merging of clusters:
     - Always merge the single best pair (lowest score) if evaluate_matrix says it's beneficial.
@@ -45,12 +178,16 @@ def merge_clusters(matrix, clusters, alpha, max_iter=None):
     """
     clusters = [list(set(c)) for c in clusters]
 
-    it = 0
-    while True:
-        it += 1
-        if max_iter is not None and it > max_iter:
-            break
+    dependencies = build_dependencies(matrix, clusters)
 
+    # DFS-based cycle detection
+    cycles = find_cycles_dfs(dependencies)
+    if cycles:
+        print("Detected dependency cycles:", cycles)
+        clusters = merge_cycles(clusters, cycles)
+
+
+    while True:
         best_score = float("inf")
         best_pair = None
         best_merged_cluster = None
