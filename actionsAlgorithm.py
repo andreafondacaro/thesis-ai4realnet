@@ -31,41 +31,95 @@ def evaluate_matrix(matrix, row_indices, col_indices, shape, alpha=0.6):
             elif (i < shape[0] and j >= shape[1]) or (i >= shape[0] and j < shape[1]):
                 if full_matrix[i, j] == 1:
                     separate_score += (1 - alpha) * 1
+    print(f"Full score: {full_score}, Separate score: {separate_score}")
         
 
-    return separate_score < full_score, full_score
+    return separate_score > full_score, full_score
 
-def merge_clusters(matrix, clusters, alpha):
-    #evaluates all the possible merges and merges if it's beneficial
-    merged_clusters = []
-    skip_indices = set()
-    for i in range(len(clusters)):
-        if i in skip_indices:
-            continue
-        cluster_a = clusters[i]
-        best_merge = cluster_a
-        best_score = float('inf')
-        for j in range(i + 1, len(clusters)):
-            if j in skip_indices:
+def merge_clusters(matrix, clusters, alpha, max_iter=None):
+    """
+    Greedy merging of clusters:
+    - Always merge the single best pair (lowest score) if evaluate_matrix says it's beneficial.
+    - Repeat until no beneficial merge exists (or max_iter is hit).
+    - Merged clusters have duplicates removed.
+    """
+    clusters = [list(set(c)) for c in clusters]
+
+    it = 0
+    while True:
+        it += 1
+        if max_iter is not None and it > max_iter:
+            break
+
+        best_score = float("inf")
+        best_pair = None
+        best_merged_cluster = None
+
+        # Find the best pair of clusters to merge
+        for i in range(len(clusters)):
+            for j in range(i + 1, len(clusters)):
+                cluster_a = clusters[i]
+                cluster_b = clusters[j]
+
+                # 1) merge & dedupe
+                merged = sorted(set(cluster_a) | set(cluster_b))
+
+                # 2) compute row/col indices from merged cluster
+                row_indices = [idx for idx in merged if idx < matrix.shape[0]]
+                col_indices = [idx - matrix.shape[0] for idx in merged if idx >= matrix.shape[0]]
+
+                cluster_sizes = (len(cluster_a) // 2, len(cluster_b) // 2)
+
+                can_merge, score = evaluate_matrix(matrix, row_indices, col_indices, cluster_sizes, alpha)
+
+                if can_merge and score < best_score:
+                    best_score = score
+                    best_pair = (i, j)
+                    best_merged_cluster = merged
+
+        # No beneficial merge found → stop
+        if best_pair is None:
+            break
+
+        i, j = best_pair
+        print(f"Merging clusters {clusters[i]} and {clusters[j]} with score {best_score}")
+
+        new_clusters = []
+        for k, c in enumerate(clusters):
+            if k == i or k == j:
                 continue
-            cluster_b = clusters[j]
-            row_indices = [idx for idx in cluster_a + cluster_b if idx < matrix.shape[0]]
-            col_indices = [idx - matrix.shape[0] for idx in cluster_a + cluster_b if idx >= matrix.shape[0]]
-            can_merge, score = evaluate_matrix(matrix, row_indices, col_indices, (len(cluster_a)//2, len(cluster_b)//2), alpha)
-            if can_merge and score < best_score:
-                best_score = score
-                best_merge = cluster_a + cluster_b
-                skip_indices.add(j)
-        merged_clusters.append(best_merge)
-    return merged_clusters
+            new_clusters.append(c)
+        new_clusters.append(best_merged_cluster)
+
+        clusters = new_clusters
+
+    return clusters
+
 
 def main():
+    '''
     matrix = np.array([[1, 0, 0, 1],
                        [0, 1, 1, 0],
                        [1, 1, 0, 0],
                        [0, 0, 1, 1],
                        [1, 0, 1, 0],
                        [0, 1, 0, 1]])
+    '''
+    matrix = np.array([[1, 1, 0, 0, 0],
+            [1, 1, 0, 0, 0],
+            [0, 0, 1, 0, 0],
+            [0, 0, 0, 1, 1],
+            [0, 0, 0, 1, 1],
+            [1, 1, 0, 0, 0],
+            [0, 0, 0, 1, 1],
+            [0, 0, 1, 0, 0],
+            [0, 0, 1, 0, 0],
+            [0, 0, 1, 0, 0],
+            [1, 1, 0, 0, 0],
+            [1, 1, 0, 0, 0],
+            [0, 0, 1, 0, 0],
+            [0, 0, 0, 1, 1],
+            [0, 0, 0, 1, 1]])
     
     clusters = find_clusters(matrix)
     print("Identified Clusters:")
