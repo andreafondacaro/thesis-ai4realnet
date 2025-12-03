@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 import time
 from matplotlib.patches import Rectangle
 from matplotlib.lines import Line2D
+import networkx as nx
 
 rng = np.random.default_rng()
 
@@ -223,88 +224,180 @@ def reorder_matrix_by_clusters(matrix, clusters):
     
     return reordered_matrix, row_order, col_order
 
-def plot_matrix(matrix, alpha, p, clusters, timetaken=None,
-                row_labels=None, col_labels=None,
-                curr_matrix_name="Matrix"):
+import networkx as nx
+
+import networkx as nx
+
+def plot_cluster_graph(matrix, clusters, alpha, p, timetaken=None,
+                       curr_matrix_name="Matrix"):
     """
-    Visualizza la matrice binaria (0/1) con celle colorate, numeri e contorni dei cluster.
-    I numeri dei cluster si riferiscono all'ordine 'row_order' e 'col_order' (non all'ordine della matrice).
+    Graph view with overlapping clusters.
+
+    - Rows  : state variables s0, s1, ...
+    - Cols  : action variables a0, a1, ...
+    - Extra: next-state nodes s'0, s'1, ... (one per state) just for
+      visualization / clustering.
+    - Bold states: states that are controlled by at least one action in
+      the *same* cluster (matrix[row, col] == 1 and both belong to that cluster).
+    - Edges: ONLY from actions to states, and only when the action / state
+      belong to different clusters (cross-cluster control).
+    - Layout: nodes are placed near the centers of the clusters they belong to,
+      so variables in the same cluster tend to be close.
     """
     matrix = np.array(matrix)
-    n_rows, n_cols = matrix.shape
-    offset = 10  # columns in clusters: offset..offset+n_cols-1
-    if n_rows > 10:
-        offset = 15
+    n_states, n_actions = matrix.shape
 
-    # fast maps: original index -> position in the PLOTTED matrix
-    row_pos = {orig_idx: pos for pos, orig_idx in enumerate(row_labels)}
-    col_pos = {orig_idx: pos for pos, orig_idx in enumerate(col_labels)}
+    # --- Cluster membership in "combined" index space (as in your code) ---
+    # 0..n_states-1                : states
+    # n_states..n_states+n_actions-1 : actions
+    combined_size = n_states + n_actions
+    membership = {k: set() for k in range(combined_size)}
+    for c_idx, cluster in enumerate(clusters):
+        for k in cluster:
+            membership[k].add(c_idx)
 
-    fig, ax = plt.subplots(figsize=(12, 10))
+    # --- Graph and nodes ---
+    G = nx.DiGraph()
 
-    cmap = plt.cm.colors.ListedColormap(['black', 'white'])
-    ax.imshow(matrix, cmap=cmap, aspect='equal')
+    state_nodes = [f"s{i}"   for i in range(n_states)]
+    action_nodes = [f"a{j}"  for j in range(n_actions)]
+    next_nodes   = [f"sp{i}" for i in range(n_states)]   # internal name for s'
 
-    ax.set_title(f"Matrice Riordinata per Cluster (alpha={alpha}, p={p})", fontsize=16)
-    ax.set_xlabel('Columns', fontsize=12)
-    ax.set_ylabel('Rows', fontsize=12)
+    G.add_nodes_from(state_nodes, kind="state")
+    G.add_nodes_from(action_nodes, kind="action")
+    G.add_nodes_from(next_nodes,   kind="next_state")
 
-    # numbers in cells
-    for i in range(n_rows):
-        for j in range(n_cols):
-            value = int(matrix[i, j])
-            ax.text(j, i, str(value), ha='center', va='center',
-                    color=('white' if value == 0 else 'black'),
-                    fontsize=12, fontweight='bold')
+    # --- Bold states: controlled by actions in the same cluster ---
+    bold_state_indices = set()
+    for cluster in clusters:
+        states_in_c  = [k for k in cluster if k < n_states]
+        actions_in_c = [k - n_states for k in cluster
+                        if n_states <= k < n_states + n_actions]
+        for s in states_in_c:
+            for a in actions_in_c:
+                if matrix[s, a] == 1:
+                    bold_state_indices.add(s)
 
-    # ticks/labels (assume labels already correspond to the plotted order)
-    if row_labels is not None:
-        ax.set_yticks(range(len(row_labels)), row_labels)
-    if col_labels is not None:
-        ax.set_xticks(range(len(col_labels)), col_labels)
+    bold_state_nodes = {f"s{i}" for i in bold_state_indices}
 
-    # faint grid
-    ax.set_xticks(np.arange(-.5, n_cols, 1), minor=True)
-    ax.set_yticks(np.arange(-.5, n_rows, 1), minor=True)
-    ax.grid(which='minor', linestyle='-', linewidth=0.5, alpha=0.4)
-    ax.tick_params(which='minor', bottom=False, left=False)
+    # --- Edges from actions -> states (cross-cluster only) ---
+    for s in range(n_states):
+        for a in range(n_actions):
+            if matrix[s, a] != 1:
+                continue
+            state_clusters  = membership[s]
+            action_clusters = membership[n_states + a]
+            cross = any(c1 != c2 for c1 in action_clusters for c2 in state_clusters)
+            if cross:
+                G.add_edge(f"a{a}", f"s{s}")   # <-- ONLY actions as sources
 
-    # draw cluster outlines honoring row_order/col_order
-    colors = plt.cm.tab10.colors
-    legend_handles = []
-    for idx, cluster in enumerate(clusters):
-        color = colors[idx % len(colors)]
-        # decode original indices from cluster encoding
-        orig_rows = sorted([r for r in cluster if 0 <= r < offset])
-        orig_cols = sorted([c - offset for c in cluster if offset <= c < offset + n_cols])
-        # map original indices to positions in the plotted matrix via row_order/col_order
-        rows = sorted([row_pos[r] for r in orig_rows if r in row_pos])
-        cols = sorted([col_pos[c] for c in orig_cols if c in col_pos])
+    # --- Layout: cluster-based positions so same-cluster nodes are close ---
+    num_clusters = max(1, len(clusters))
+    cluster_centers = {}
+    radius = 3.0
+    for c_idx in range(num_clusters):
+        angle = 2 * np.pi * c_idx / num_clusters
+        cluster_centers[c_idx] = np.array([radius * np.cos(angle),
+                                           radius * np.sin(angle)])
 
-        if not rows or not cols:
-            continue
+    rng_local = np.random.default_rng(0)  # deterministic jitter
+    pos = {}
 
-        # draw 1×1 rectangles on every cross-product cell
-        for r in rows:
-            for c in cols:
-                ax.add_patch(Rectangle((c - 0.5, r - 0.5), 1, 1,
-                                       fill=False, linewidth=2, edgecolor=color))
+    def position_for_index(idx, extra_shift=np.array([0.0, 0.0])):
+        """idx is in [0, n_states+n_actions); extra_shift used for s' nodes."""
+        cl = membership.get(idx, set())
+        if cl:
+            centers = np.array([cluster_centers[c] for c in cl])
+            base = centers.mean(axis=0)
+        else:
+            base = np.array([0.0, 0.0])
+        jitter = rng_local.normal(scale=0.25, size=2)
+        return base + jitter + extra_shift
 
-        # legend: show indices in the *original* numbering for clarity
+    # place states and actions
+    for i in range(n_states):
+        pos[f"s{i}"] = position_for_index(i, extra_shift=np.array([-0.3, 0.0]))
+    for j in range(n_actions):
+        pos[f"a{j}"] = position_for_index(n_states + j,
+                                          extra_shift=np.array([0.3, 0.0]))
 
-        legend_handles.append(
-            Line2D([0], [0], color=color, lw=3,
-                   label=f"Cluster {idx+1}  R:{orig_rows}  C:{orig_cols}")
-        )
+    # place next states near their corresponding states
+    for i in range(n_states):
+        pos[f"sp{i}"] = pos[f"s{i}"] + np.array([0.0, 0.5])  # small offset above
 
-    if legend_handles:
-        ax.legend(handles=legend_handles, loc='upper right', framealpha=0.9)
+    # --- Draw ---
+    fig, ax = plt.subplots(figsize=(11, 8))
 
+    # nodes
+    nx.draw_networkx_nodes(G, pos,
+                           nodelist=state_nodes,
+                           node_shape='s',
+                           node_size=700,
+                           ax=ax)
+    nx.draw_networkx_nodes(G, pos,
+                           nodelist=action_nodes,
+                           node_shape='o',
+                           node_size=700,
+                           ax=ax)
+    nx.draw_networkx_nodes(G, pos,
+                           nodelist=next_nodes,
+                           node_shape='s',
+                           node_size=500,
+                           ax=ax)
+
+    # edges (only from actions)
+    nx.draw_networkx_edges(G, pos,
+                           arrows=True,
+                           arrowstyle='->',
+                           arrowsize=18,
+                           width=1.5,
+                           ax=ax)
+
+    # labels:
+    labels = {}
+    for i in range(n_states):
+        labels[f"s{i}"] = f"s{i}"
+        labels[f"sp{i}"] = f"s'{i}"
+    for j in range(n_actions):
+        labels[f"a{j}"] = f"a{j}"
+
+    normal_nodes = [n for n in G.nodes() if n not in bold_state_nodes]
+    nx.draw_networkx_labels(G, pos,
+                            labels={n: labels[n] for n in normal_nodes},
+                            font_weight='normal',
+                            font_size=10,
+                            ax=ax)
+    nx.draw_networkx_labels(G, pos,
+                            labels={n: labels[n] for n in bold_state_nodes},
+                            font_weight='bold',
+                            font_size=10,
+                            ax=ax)
+
+    # legend
+    state_proxy = Line2D([0], [0], marker='s', linestyle='None',
+                         label='State s', markersize=10)
+    next_proxy  = Line2D([0], [0], marker='s', linestyle='None',
+                         label="Next state s'", markersize=8)
+    action_proxy = Line2D([0], [0], marker='o', linestyle='None',
+                          label='Action a', markersize=10)
+    bold_proxy  = Line2D([0], [0], marker='s', linestyle='None',
+                         label='State controlled in same cluster',
+                         markersize=10, markeredgewidth=2)
+    ax.legend(handles=[state_proxy, next_proxy, action_proxy, bold_proxy],
+              loc='upper left')
+
+    title = f"Cluster Graph (alpha={alpha}, p={p})"
+    if timetaken is not None:
+        title += f"  time={timetaken:.2f} ms"
+    ax.set_title(title)
+    ax.axis('off')
+
+    out_path = rf"C:\Users\andre\Desktop\Uni\Tesi\test_images\{curr_matrix_name}_alpha_{alpha}_p_{p}_graph_{timetaken:.2f}.png"
     plt.tight_layout()
-
-    out_path = rf"C:\Users\andre\Desktop\Uni\Tesi\test_images\{curr_matrix_name}_alpha_{alpha}_p_{p}_time_{timetaken:.2f}.png"
     plt.savefig(out_path, dpi=300)
     plt.close(fig)
+
+
 
 
 def flip_bits(M, p):
@@ -371,11 +464,14 @@ def main():
                 plot_matrix(reordered_matrix, alpha, p, clusters, timetaken=(end-start)*1000, row_labels=row_order, col_labels=col_order, curr_matrix_name=curr_matrix_name)
 '''
     print(f"Analyzing matrix with alpha={0.4} and flip probability={0.3}")
-    noisy_matrix = flip_bits(M1, 0.3)
+    noisy_matrix = flip_bits(M1, 0.1)
     start = time.perf_counter()
+
     reordered_matrix, row_order, col_order, clusters = analyze_matrix(noisy_matrix, 0.4)
     end = time.perf_counter()
-    plot_matrix(reordered_matrix, 0.4, 0.3, clusters, timetaken=(end-start)*1000, row_labels=row_order, col_labels=col_order, curr_matrix_name="M1")
+    print(f"Reordered matrix:\n{noisy_matrix}")
+    #plot_matrix(reordered_matrix, 0.4, 0.3, clusters, timetaken=(end-start)*1000, row_labels=row_order, col_labels=col_order, curr_matrix_name="M1")
+    plot_cluster_graph(noisy_matrix, clusters, 0.4, 0.1, timetaken=(end-start)*1000, curr_matrix_name="M1")
 
 if __name__ == "__main__":
     main()
