@@ -12,7 +12,7 @@ def find_clusters(matrix):
     for i in range(cols, rows):
         curr_cluster = [i]
         for j in range(cols):
-            if matrix[i, j] == 1:
+            if matrix[i, j] > 0.5:
                 curr_cluster.append(j)
                 curr_cluster.append(j + rows)
         clusters.append((curr_cluster))
@@ -90,27 +90,30 @@ def build_dependencies(matrix, clusters):
 
     return dependencies
 
-def evaluate_matrix(matrix, row_indices, col_indices, shape, alpha=0.6):
+def evaluate_matrix(matrix, row_indices, col_indices, shape_cl1, shape_cl2, alpha=0.6):
 #computes scores for the 2 separate matrices and compares them to the full matrix
     full_score = 0
     separate_score = 0
     full_matrix = matrix[np.ix_(row_indices, col_indices)]
+    print(row_indices, col_indices, shape_cl1, shape_cl2)
 
     for i in range(full_matrix.shape[0]):
         for j in range(full_matrix.shape[1]):
-            if full_matrix[i, j] == 0:
-                full_score += alpha * 1
-            if i < shape[0] and j < shape[1] and full_matrix[i, j] == 0:
-                separate_score += alpha * 1
-            elif i >= shape[0] and j >= shape[1] and full_matrix[i, j] == 0:
-                separate_score += alpha * 1
-            elif (i < shape[0] and j >= shape[1]) or (i >= shape[0] and j < shape[1]):
-                if full_matrix[i, j] == 1:
-                    separate_score += (1 - alpha) * 1
+            full_score += alpha * (1 - full_matrix[i, j])
+            print("Adding to full_score (alpha):", i, j, 1 - full_matrix[i, j])
+            if i < shape_cl1[0] and j < shape_cl1[1]:
+                separate_score += alpha * (1 - full_matrix[i, j])
+                print("Adding to separate_score (alpha):", i, j, 1 - full_matrix[i, j])
+            elif i >= full_matrix.shape[0] - shape_cl2[0] and j >= full_matrix.shape[1] - shape_cl2[1]:
+                separate_score += alpha * (1 - full_matrix[i, j])
+                print("Adding to separate_score (alpha):", i, j, 1 - full_matrix[i, j])
+            elif (i > shape_cl1[0] and j < full_matrix.shape[1] - shape_cl2[1]) or (i < full_matrix.shape[0] - shape_cl2[0] and j > shape_cl1[1]):
+                    separate_score += (1 - alpha) * full_matrix[i, j]
+                    print("Adding to separate_score (1-alpha):", i, j, full_matrix[i, j])
     print(f"Full score: {full_score}, Separate score: {separate_score}")
-        
+    
 
-    return separate_score > full_score, full_score
+    return separate_score >= full_score, full_score
 
 def find_cycles_dfs(dependencies):
     """
@@ -151,51 +154,77 @@ def find_cycles_dfs(dependencies):
 
     return cycles
 
-def merge_cycles(clusters, cycles):
+import numpy as np
+
+def merge_cycles(clusters, cycles, matrix, alpha=0.6, verbose=False):
     """
-    Merge clusters according to cycles.
+    Merge clusters according to cycles, but only if evaluate_matrix returns True
+    for the candidate merge.
 
-    - `clusters`: list of lists of elements (e.g. variable indices)
-    - `cycles`  : list of lists of *cluster indices* (e.g. [0,2,3])
-
-    All clusters that appear in the same connected component of the
-    "cycle graph" are merged into a single cluster.
-
-    Returns: list of sorted lists, with no duplicates.
+    Assumes:
+      - matrix is square
+      - cluster elements are indices into matrix rows/cols
     """
     n = len(clusters)
     parent = list(range(n))
 
+    # keep current elements for each DSU root
+    comp_elems = {i: set(clusters[i]) for i in range(n)}
+
     def find(x):
         while parent[x] != x:
-            parent[x] = parent[parent[x]]  # path compression
+            parent[x] = parent[parent[x]]
             x = parent[x]
         return x
 
-    def union(a, b):
+    def try_union(a, b):
         ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[rb] = ra
+        if ra == rb:
+            return False
 
-    # 1) Use cycles to union cluster indices
-    used_indices = set()
+        cluster_a = comp_elems[ra]
+        cluster_b = comp_elems[rb]
+
+        a_set, b_set = set(cluster_a), set(cluster_b)
+        merged = (
+        [x for x in cluster_a if x in a_set - b_set] +
+        [x for x in cluster_a if x in a_set & b_set] +
+        [x for x in cluster_b if x in b_set - a_set]
+        )
+
+        # 2) compute row/col indices from merged cluster
+        row_indices = [idx for idx in merged if idx < matrix.shape[0]]
+        col_indices = [idx - matrix.shape[0] for idx in merged if idx >= matrix.shape[0]]
+
+        shape_a = (len([x for x in cluster_a if x < matrix.shape[0]]),
+                    len([x for x in cluster_a if x >= matrix.shape[0]]))
+        shape_b = (len([x for x in cluster_b if x < matrix.shape[0]]),
+                    len([x for x in cluster_b if x >= matrix.shape[0]]))
+        ok, _ = evaluate_matrix(matrix, row_indices, col_indices, shape_a, shape_b, alpha=alpha)
+        if ok:
+            parent[rb] = ra
+            comp_elems[ra].update(comp_elems[rb])
+            del comp_elems[rb]
+            return True
+
+        return False
+
+    # Apply cycle constraints, but union only when "good"
     for cycle in cycles:
         if not cycle:
             continue
-        used_indices.update(cycle)
         base = cycle[0]
         for idx in cycle[1:]:
-            union(base, idx)
+            try_union(base, idx)
 
-    # 2) Build groups: root -> union of all elements in those clusters
-    groups = {}
-    for i, c in enumerate(clusters):
-        root = find(i) if i in used_indices else i   # untouched clusters stay alone
-        groups.setdefault(root, set()).update(c)
+    # Return merged clusters (unique roots)
+    roots = {}
+    for i in range(n):
+        r = find(i)
+        roots.setdefault(r, set()).update(clusters[i])
 
-    # 3) Return list of unique merged clusters (no duplicates)
-    merged_sets = [sorted(s) for s in groups.values()]
-    return merged_sets
+    return [sorted(s) for s in roots.values()]
+
 
 
 def merge_clusters(matrix, clusters, alpha):
@@ -213,7 +242,7 @@ def merge_clusters(matrix, clusters, alpha):
     cycles = find_cycles_dfs(dependencies)
     if cycles:
         print("Detected dependency cycles:", cycles)
-        clusters = merge_cycles(clusters, cycles)
+        clusters = merge_cycles(clusters, cycles, matrix, alpha)
         print("Clusters after merging cycles:", clusters)
 
     while True:
@@ -228,15 +257,24 @@ def merge_clusters(matrix, clusters, alpha):
                 cluster_b = clusters[j]
 
                 # 1) merge & dedupe
-                merged = sorted(set(cluster_a) | set(cluster_b))
+                a_set, b_set = set(cluster_a), set(cluster_b)
+                merged = (
+                [x for x in cluster_a if x in a_set - b_set] +
+                [x for x in cluster_a if x in a_set & b_set] +
+                [x for x in cluster_b if x in b_set - a_set]
+                )
 
                 # 2) compute row/col indices from merged cluster
                 row_indices = [idx for idx in merged if idx < matrix.shape[0]]
                 col_indices = [idx - matrix.shape[0] for idx in merged if idx >= matrix.shape[0]]
 
-                cluster_sizes = (len(cluster_a) // 2, len(cluster_b) // 2)
+                shape_a = (len([x for x in cluster_a if x < matrix.shape[0]]),
+                           len([x for x in cluster_a if x >= matrix.shape[0]]))
+                shape_b = (len([x for x in cluster_b if x < matrix.shape[0]]),
+                           len([x for x in cluster_b if x >= matrix.shape[0]]))
+                print("Evaluating merge of", cluster_a, "and", cluster_b)
 
-                can_merge, score = evaluate_matrix(matrix, row_indices, col_indices, cluster_sizes, alpha)
+                can_merge, score = evaluate_matrix(matrix, row_indices, col_indices, shape_a, shape_b, alpha)
 
                 if can_merge and score < best_score:
                     best_score = score
@@ -261,18 +299,29 @@ def merge_clusters(matrix, clusters, alpha):
 
     return clusters
 
+import numpy as np
+import networkx as nx
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+
 def plot_cluster_graph(matrix, clusters, alpha, timetaken=None,
                        curr_matrix_name="Matrix"):
     """
     Graph view with overlapping clusters.
+    States and next states are represented by the same node (s0, s1, ...).
+
+    Draws:
+      - state -> state edges (only between states in different clusters, no self-loops)
+      - action -> state edges (between different clusters as before)
     """
     matrix = np.array(matrix)
     n_states = matrix.shape[1]
     n_actions = matrix.shape[0] - n_states
 
-    # 0..n_states-1                : states
-    # n_states..n_states+n_actions-1 : actions
-    combined_size = n_states*2 + n_actions
+    # 0..n_states-1                    : states
+    # n_states..n_states+n_actions-1   : actions
+    # 2*n_states..2*n_states+n_actions-1 : (next states, not used as nodes now)
+    combined_size = n_states * 2 + n_actions
     membership = {k: set() for k in range(combined_size)}
     for c_idx, cluster in enumerate(clusters):
         for k in cluster:
@@ -281,14 +330,13 @@ def plot_cluster_graph(matrix, clusters, alpha, timetaken=None,
     # --- Graph and nodes ---
     G = nx.DiGraph()
 
-    state_nodes = [f"s{i}"   for i in range(n_states)]
+    state_nodes  = [f"s{i}"  for i in range(n_states)]
     action_nodes = [f"a{j}"  for j in range(n_actions)]
-    next_nodes   = [f"sp{i}" for i in range(n_states)]
 
-    #G.add_nodes_from(state_nodes, kind="state")
+    G.add_nodes_from(state_nodes,  kind="state")
     G.add_nodes_from(action_nodes, kind="action")
-    G.add_nodes_from(next_nodes,   kind="next_state")
 
+    # --- bold states: states that are "controlled" by an action in the same cluster ---
     bold_state_indices = set()
     for cluster in clusters:
         states_in_c  = [k for k in cluster if k < n_states]
@@ -296,21 +344,45 @@ def plot_cluster_graph(matrix, clusters, alpha, timetaken=None,
                         if n_states <= k < n_states + n_actions]
         for s in states_in_c:
             for a in actions_in_c:
-                if matrix[n_states + a, s] == 1 and s >= n_states:
+                # fixed: s is already 0..n_states-1, don't check s >= n_states
+                if matrix[n_states + a, s] == 1:
                     bold_state_indices.add(s)
 
     bold_state_nodes = {f"s{i}" for i in bold_state_indices}
 
-    # edges creation only action next state
+    # --- Edges ---
+
+    # 1) action -> state edges (bottom n_actions rows)
     for s in range(n_states):
         for a in range(n_actions):
             if matrix[n_states + a, s] != 1:
                 continue
             state_clusters  = membership[s]
             action_clusters = membership[n_states + a]
-            cross = any(c1 != c2 for c1 in action_clusters for c2 in state_clusters)
+            # only if they belong to different clusters
+            if state_clusters and action_clusters:
+                cross = any(c1 != c2 for c1 in action_clusters for c2 in state_clusters)
+            else:
+                cross = False
             if cross:
-                G.add_edge(f"a{a}", f"sp{s}")
+                G.add_edge(f"a{a}", f"s{s}")
+
+    # 2) state -> state edges (top-left n_states x n_states block)
+    #    Only between different states, and only if they belong to different clusters.
+    for i in range(n_states):
+        for j in range(n_states):
+            if i == j:
+                continue  # no self-loops
+            if matrix[i, j] != 1:
+                continue
+            clusters_i = membership[i]
+            clusters_j = membership[j]
+            if clusters_i and clusters_j:
+                cross = any(c1 != c2 for c1 in clusters_i for c2 in clusters_j)
+            else:
+                cross = False
+            if cross:
+                G.add_edge(f"s{i}", f"s{j}")
 
     # --- Layout: cluster-based positions so same-cluster nodes are close ---
     num_clusters = max(1, len(clusters))
@@ -325,7 +397,7 @@ def plot_cluster_graph(matrix, clusters, alpha, timetaken=None,
     pos = {}
 
     def position_for_index(idx, extra_shift=np.array([0.0, 0.0])):
-        """idx is in [0, n_states+n_actions); extra_shift used for s' nodes."""
+        """idx is in [0, n_states+n_actions); extra_shift used to separate states/actions."""
         cl = membership.get(idx, set())
         if cl:
             centers = np.array([cluster_centers[c] for c in cl])
@@ -342,31 +414,22 @@ def plot_cluster_graph(matrix, clusters, alpha, timetaken=None,
         pos[f"a{j}"] = position_for_index(n_states + j,
                                           extra_shift=np.array([0.3, 0.0]))
 
-    # place next states near their corresponding states
-    for i in range(n_states):
-        pos[f"sp{i}"] = pos[f"s{i}"] + np.array([0.0, 0.5])  # small offset above
-
     # --- Draw ---
     fig, ax = plt.subplots(figsize=(11, 8))
 
     # nodes
-    '''nx.draw_networkx_nodes(G, pos,
+    nx.draw_networkx_nodes(G, pos,
                            nodelist=state_nodes,
                            node_shape='s',
                            node_size=700,
-                           ax=ax)'''
+                           ax=ax)
     nx.draw_networkx_nodes(G, pos,
                            nodelist=action_nodes,
                            node_shape='o',
                            node_size=700,
                            ax=ax)
-    nx.draw_networkx_nodes(G, pos,
-                           nodelist=next_nodes,
-                           node_shape='s',
-                           node_size=500,
-                           ax=ax)
 
-    # edges (only from actions)
+    # edges
     nx.draw_networkx_edges(G, pos,
                            arrows=True,
                            arrowstyle='->',
@@ -374,11 +437,10 @@ def plot_cluster_graph(matrix, clusters, alpha, timetaken=None,
                            width=1.5,
                            ax=ax)
 
-    # labels:
+    # labels
     labels = {}
     for i in range(n_states):
         labels[f"s{i}"] = f"s{i}"
-        labels[f"sp{i}"] = f"s'{i}"
     for j in range(n_actions):
         labels[f"a{j}"] = f"a{j}"
 
@@ -395,16 +457,14 @@ def plot_cluster_graph(matrix, clusters, alpha, timetaken=None,
                             ax=ax)
 
     # legend
-    state_proxy = Line2D([0], [0], marker='s', linestyle='None',
-                         label='State s', markersize=10)
-    next_proxy  = Line2D([0], [0], marker='s', linestyle='None',
-                         label="Next state s'", markersize=8)
+    state_proxy  = Line2D([0], [0], marker='s', linestyle='None',
+                          label='State s', markersize=10)
     action_proxy = Line2D([0], [0], marker='o', linestyle='None',
                           label='Action a', markersize=10)
-    bold_proxy  = Line2D([0], [0], marker='s', linestyle='None',
-                         label='State controlled in same cluster',
-                         markersize=10, markeredgewidth=2)
-    ax.legend(handles=[state_proxy, next_proxy, action_proxy, bold_proxy],
+    bold_proxy   = Line2D([0], [0], marker='s', linestyle='None',
+                          label='State controlled in same cluster',
+                          markersize=10, markeredgewidth=2)
+    ax.legend(handles=[state_proxy, action_proxy, bold_proxy],
               loc='upper right')
 
     title = f"Cluster Graph (alpha={alpha})"
@@ -418,6 +478,8 @@ def plot_cluster_graph(matrix, clusters, alpha, timetaken=None,
     plt.savefig(out_path, dpi=300)
     plt.close(fig)
 
+
+
 def flip_bits(M, p):
     """
     With prob. p flips each 0→1 and 1→0 independently.
@@ -426,18 +488,6 @@ def flip_bits(M, p):
     return np.where(flips, 1-M, M)
 
 def main():
-    '''
-    matrix = np.array([[1, 1, 0, 0, 0],
-                   [1, 1, 0, 0, 0],
-                   [0, 0, 1, 1, 0],
-                   [0, 0, 1, 1, 0],
-                   [0, 0, 0, 0, 1],
-                   [0, 0, 0, 0, 1],
-                   [1, 1, 0, 0, 0],
-                   [1, 1, 0, 0, 0],
-                   [0, 0, 1, 1, 0],
-                   [0, 0, 0, 0, 1]])
-    '''
     matrix = np.array([[1, 1, 0, 0, 0],
             [1, 1, 0, 0, 0],
             [0, 0, 1, 0, 0],
@@ -453,21 +503,30 @@ def main():
             [0, 0, 1, 0, 0],
             [0, 0, 0, 1, 1],
             [0, 0, 0, 1, 1]])
-    
+    rng = np.random.default_rng(42)  # opzionale: per risultati riproducibili
+
+    new_matrix = np.empty(matrix.shape, dtype=float)
+
+    mask0 = (matrix == 0)
+    mask1 = (matrix == 1)
+
+    new_matrix[mask0] = rng.uniform(0.0, 0.3, size=mask0.sum())
+    new_matrix[mask1] = rng.uniform(0.7, 1.0, size=mask1.sum())
+    matrix = new_matrix
     matrix = flip_bits(matrix, 0.0)
     start = time.perf_counter()
     clusters = find_clusters(matrix)
     print("Identified Clusters:")
     for cluster in clusters:
         print(cluster)
-    alpha = 0.6
+    alpha = 0.4
     merged_clusters = merge_clusters(matrix, clusters, alpha)
     end = time.perf_counter()
     timetaken = (end - start) * 1000
     print("\nMerged Clusters:")
     for cluster in merged_clusters:
         print(cluster)
-    plot_cluster_graph(matrix, merged_clusters, alpha=0.6, timetaken=timetaken)
+    plot_cluster_graph(matrix, merged_clusters, alpha=alpha, timetaken=timetaken)
 
 if __name__ == "__main__":
     main()
