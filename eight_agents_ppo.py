@@ -188,91 +188,129 @@ def compute_transition_mi_matrix(Z_t, S_tp1):
 # -----------------------------
 # PettingZoo ParallelEnv with dynamic #agents from clusters
 # -----------------------------
-class PowerSplitClusteredParallelEnv(ParallelEnv):
-    """
-    Agents = clusters. Each agent observes only the subset of variables in its cluster
-    (masked out in a fixed-size vector for parameter sharing PPO).
 
-    Action ownership:
-      - MI row 5 => action for idxA (AA)
-      - MI row 6 => action for idxB (AB)
+class PowerChainClusteredParallelEnv(ParallelEnv):
     """
-    metadata = {"name": "power_split_clustered_v0"}
+    N generators feeding N+1 adjacent lines (chain).
+    Agents = clusters (list of MI-row indices).
+
+    MI conventions:
+      - matrix shape = (n_rows, n_cols)
+      - "action rows" correspond to controls and live at rows [n_cols .. n_rows-1]
+      - n_controls = n_rows - n_cols  (should equal N generators)
+
+    Control mapping:
+      - control k corresponds to action-row r = n_cols + k
+      - an agent "owns" control k if its cluster contains row r
+      - agent's single action is applied to all controls it owns
+
+    Observation:
+      - base vector length n_rows
+          * rows 0..n_cols-1: state variables at time t (we fill these)
+          * rows n_cols..n_rows-1: previous actions per control (we fill these)
+        then masked by cluster membership (rows not in cluster -> 0)
+      - idx vector length n_controls:
+          * idx[k] visible ONLY to the agent that owns control k (else 0)
+      - optional forecast: generator outputs at t+1 (length N), visible to all
+      - agent id scalar in [0,1] for parameter sharing
+    Reward (shared):
+      - at t+1, make line loads equal: target = total_generation/(N+1)
+      - reward = -sum_j (load_j - target)^2 normalized
+    """
+
+    metadata = {"name": "power_chain_clustered_v0"}
 
     def __init__(
         self,
-        GA_profile,
-        GB_profile,
-        clusters,
+        G_profiles,          # shape (T, N)
+        clusters,            # list[list[int]] of MI row indices
+        matrix_shape,        # (n_rows, n_cols) of your MI matrix
         episode_len=1000,
         seed=0,
         include_forecast=True,
     ):
         super().__init__()
         self.rng = np.random.default_rng(seed)
-
-        self.GA = np.asarray(GA_profile, dtype=np.float32)
-        self.GB = np.asarray(GB_profile, dtype=np.float32)
-        assert self.GA.shape == self.GB.shape
-
-        self.max_total = float(self.GA.max() + self.GB.max())
-        self.episode_len = int(episode_len)
         self.include_forecast = bool(include_forecast)
 
-        # clusters: list[list[int]] (row indices 0..6)
+        G_profiles = np.asarray(G_profiles, dtype=np.float32)
+        if G_profiles.ndim != 2:
+            raise ValueError("G_profiles must be a 2D array of shape (T, N).")
+        self.G = G_profiles
+        self.T, self.N = self.G.shape
+        self.n_lines = self.N + 1
+        self.episode_len = int(episode_len)
+
+        n_rows, n_cols = map(int, matrix_shape)
+        if n_rows <= n_cols:
+            raise ValueError("matrix_shape must satisfy n_rows > n_cols (need action rows).")
+        self.n_rows = n_rows
+        self.n_cols = n_cols
+        self.n_controls = n_rows - n_cols
+
+        # Require controls to match generators for this topology
+        if self.n_controls != self.N:
+            raise ValueError(
+                f"Expected n_controls = n_rows-n_cols to equal N generators.\n"
+                f"Got n_controls={self.n_controls}, N={self.N}. "
+                f"Pass a matrix_shape consistent with your MI construction."
+            )
+
+        if self.T < self.episode_len + 2:
+            raise ValueError("G_profiles too short for episode_len+2 (needs room for t+1).")
+
+        # Agents = clusters
         self.clusters = [list(map(int, c)) for c in clusters]
         self.n_agents = len(self.clusters)
         if self.n_agents < 1:
-            raise ValueError("clusters must contain at least one cluster")
+            raise ValueError("clusters must not be empty.")
 
         self.possible_agents = [f"agent_{i}" for i in range(self.n_agents)]
         self.agents = []
 
-        # Determine which agent controls idxA and idxB
-        # row 5 -> AA, row 6 -> AB
-        self.owner_A = None
-        self.owner_B = None
-        for i, c in enumerate(self.clusters):
-            if 5 in c and self.owner_A is None:
-                self.owner_A = i
-            if 6 in c and self.owner_B is None:
-                self.owner_B = i
+        # Ownership: each control k is owned by the (first) cluster that contains action-row (n_cols+k)
+        self.control_owner = [None] * self.n_controls
+        for ai, c in enumerate(self.clusters):
+            for k in range(self.n_controls):
+                action_row = self.n_cols + k
+                if action_row in c and self.control_owner[k] is None:
+                    self.control_owner[k] = ai
 
-        # We'll include these base features (some masked depending on cluster):
-        # 0 PL1, 1 PL2, 2 PL3, 3 GA_state, 4 GB_state, 5 prev_AA, 6 prev_AB
-        # plus idxA, idxB (useful for control), plus optional forecast (GA_tp1, GB_tp1),
-        # plus agent-id onehot(n_agents).
-        self.base_dim = 7
-        self.extra_dim = 2 + (2 if self.include_forecast else 0) + self.n_agents
-        self._obs_dim = self.base_dim + self.extra_dim
+        # Optional: enforce every control is owned (recommended)
+        if any(o is None for o in self.control_owner):
+            missing = [k for k, o in enumerate(self.control_owner) if o is None]
+            raise ValueError(f"Some controls are unowned by clusters: {missing}. "
+                             f"Ensure each action-row {list(range(self.n_cols, self.n_rows))} appears in some cluster.")
+
+        # Scaling
+        self.max_total = float(np.max(np.sum(self.G, axis=1)))
+        if self.max_total <= 0:
+            self.max_total = 1.0
+
+        # Observation size
+        # base(n_rows) + idxs(n_controls=N) + forecast(N if on) + agent_id_scalar(1)
+        self._obs_dim = self.n_rows + self.n_controls + (self.N if self.include_forecast else 0) + 1
 
         self._obs_spaces = {
             a: spaces.Box(low=0.0, high=1.0, shape=(self._obs_dim,), dtype=np.float32)
             for a in self.possible_agents
         }
-        self._act_spaces = {a: spaces.Discrete(2) for a in self.possible_agents}
+        self._act_spaces = {a: spaces.Discrete(len(ACTIONS)) for a in self.possible_agents}
 
-        # env state
+        # State
         self.t0 = 0
         self.t = 0
-        self.idxA = 0
-        self.idxB = 0
-        self.PL1 = self.PL2 = self.PL3 = 0.0
-        self.prev_AA = 0
-        self.prev_AB = 0
+        self.idx = np.zeros(self.N, dtype=np.int64)          # one split index per generator/control
+        self.prev_delta = np.zeros(self.N, dtype=np.int64)   # last applied delta per control (e.g. -1/+1)
+        self.loads = np.zeros(self.n_lines, dtype=np.float32)
 
-        # for encoding (same logic as simulate_transitions)
-        self.max_val_for_enc = int(np.ceil(self.max_total))
-        self.max_enc_state = float((self.max_val_for_enc + 1) * (self.max_val_for_enc + 1) - 1)
-
-        # Precompute per-agent masks over the first 7 base features
-        # If index is in that cluster -> visible; otherwise masked to 0.
+        # Precompute row masks per agent (mask base vector)
         self._base_masks = []
         for c in self.clusters:
-            m = np.zeros(self.base_dim, dtype=np.float32)
-            for idx in c:
-                if 0 <= idx < self.base_dim:
-                    m[idx] = 1.0
+            m = np.zeros(self.n_rows, dtype=np.float32)
+            for r in c:
+                if 0 <= r < self.n_rows:
+                    m[r] = 1.0
             self._base_masks.append(m)
 
     def observation_space(self, agent):
@@ -281,55 +319,66 @@ class PowerSplitClusteredParallelEnv(ParallelEnv):
     def action_space(self, agent):
         return self._act_spaces[agent]
 
-    def _encode_states(self):
-        PL1_i = int(round(self.PL1))
-        PL2_i = int(round(self.PL2))
-        PL3_i = int(round(self.PL3))
-        SA = encode_pair(PL1_i, PL2_i, max_val=self.max_val_for_enc)
-        SB = encode_pair(PL2_i, PL3_i, max_val=self.max_val_for_enc)
-        return float(SA), float(SB)
+    def _compute_loads(self, outputs_t, idx_vec):
+        """outputs_t shape (N,), idx_vec shape (N,) -> loads shape (N+1,)"""
+        loads = np.zeros(self.n_lines, dtype=np.float32)
+        for i in range(self.N):
+            left_pct, right_pct = (L_SPLITS[int(idx_vec[i])] / 100.0)
+            gi = float(outputs_t[i])
+            loads[i]     += left_pct * gi
+            loads[i + 1] += right_pct * gi
+        return loads
 
     def _get_obs(self, agent):
-        # agent index
         ai = int(agent.split("_")[-1])
 
-        SA, SB = self._encode_states()
+        outputs_t = self.G[self.t0 + self.t]          # (N,)
+        loads_t = self.loads                          # (N+1,)
 
-        # base features (7)
-        # scale loads by max_total, states by max_enc_state, prev actions from {-1,0,1} -> [0,1]
-        base = np.zeros(self.base_dim, dtype=np.float32)
-        base[0] = float(self.PL1) / self.max_total
-        base[1] = float(self.PL2) / self.max_total
-        base[2] = float(self.PL3) / self.max_total
-        base[3] = float(SA) / self.max_enc_state
-        base[4] = float(SB) / self.max_enc_state
-        base[5] = (float(self.prev_AA) + 1.0) / 2.0
-        base[6] = (float(self.prev_AB) + 1.0) / 2.0
+        # ---- base vector length n_rows
+        base = np.zeros(self.n_rows, dtype=np.float32)
 
-        # apply mask
+        # Fill "state rows" 0..n_cols-1.
+        # Here we define the state variables to be:
+        #   [loads (N+1), generator outputs (N)] -> total 2N+1 entries
+        # This must match how you built your MI matrix columns.
+        state_vec = np.concatenate([loads_t, outputs_t], axis=0)  # length 2N+1
+        if state_vec.shape[0] != self.n_cols:
+            raise RuntimeError(
+                f"Internal mismatch: expected n_cols={self.n_cols} to equal 2N+1={2*self.N+1}.\n"
+                f"Either change matrix_shape construction or change state_vec definition."
+            )
+        base[:self.n_cols] = state_vec / self.max_total
+
+        # Fill "action rows" n_cols..n_rows-1 with previous deltas for each control
+        amin = float(np.min(ACTIONS))
+        amax = float(np.max(ACTIONS))
+        for k in range(self.N):
+            r = self.n_cols + k
+            a = float(self.prev_delta[k])
+            base[r] = 0.0 if amax == amin else (a - amin) / (amax - amin)
+
+        # Mask base by cluster membership
         base *= self._base_masks[ai]
 
-        # idxA/idxB scaled to [0,1]
-        idxs = np.zeros(2, dtype=np.float32)
-
-        if self.owner_A is not None and ai == self.owner_A:
-            idxs[0] = self.idxA / (len(L_SPLITS) - 1)
-
-        if self.owner_B is not None and ai == self.owner_B:
-            idxs[1] = self.idxB / (len(L_SPLITS) - 1)
+        # ---- idx visibility: only owner sees its idx[k]
+        idxs = np.zeros(self.N, dtype=np.float32)
+        for k in range(self.N):
+            if self.control_owner[k] == ai:
+                idxs[k] = float(self.idx[k]) / float(len(L_SPLITS) - 1)
 
         parts = [base, idxs]
 
+        # ---- optional forecast (outputs at t+1)
         if self.include_forecast:
-            GA_tp1 = float(self.GA[self.t0 + self.t + 1]) / self.max_total
-            GB_tp1 = float(self.GB[self.t0 + self.t + 1]) / self.max_total
-            parts.append(np.array([GA_tp1, GB_tp1], dtype=np.float32))
+            outputs_tp1 = self.G[self.t0 + self.t + 1]
+            parts.append(outputs_tp1 / self.max_total)
 
-        agent_id = np.zeros(self.n_agents, dtype=np.float32)
-        agent_id[ai] = 1.0
+        # ---- agent id scalar (fixed size, works for 4 or 8 agents)
+        agent_id = np.array([ai / max(1, self.n_agents - 1)], dtype=np.float32)
         parts.append(agent_id)
 
-        return np.concatenate(parts, axis=0)
+        return np.concatenate(parts, axis=0).astype(np.float32)
 
     def reset(self, seed=None, options=None):
         if seed is not None:
@@ -337,25 +386,15 @@ class PowerSplitClusteredParallelEnv(ParallelEnv):
 
         self.agents = self.possible_agents[:]
 
-        max_start = len(self.GA) - (self.episode_len + 2)
+        max_start = self.T - (self.episode_len + 2)
         self.t0 = int(self.rng.integers(0, max_start))
         self.t = 0
 
-        self.idxA = int(self.rng.integers(0, len(L_SPLITS)))
-        self.idxB = int(self.rng.integers(0, len(L_SPLITS)))
+        self.idx = self.rng.integers(0, len(L_SPLITS), size=self.N, dtype=np.int64)
+        self.prev_delta[:] = 0
 
-        self.prev_AA = 0
-        self.prev_AB = 0
-
-        GA0 = float(self.GA[self.t0 + self.t])
-        GB0 = float(self.GB[self.t0 + self.t])
-
-        A_L1, A_L2 = (L_SPLITS[self.idxA] / 100.0)
-        B_L2, B_L3 = (L_SPLITS[self.idxB] / 100.0)
-
-        self.PL1 = A_L1 * GA0
-        self.PL2 = A_L2 * GA0 + B_L2 * GB0
-        self.PL3 = B_L3 * GB0
+        outputs_0 = self.G[self.t0 + self.t]
+        self.loads = self._compute_loads(outputs_0, self.idx)
 
         obs = {a: self._get_obs(a) for a in self.agents}
         infos = {a: {} for a in self.agents}
@@ -365,46 +404,31 @@ class PowerSplitClusteredParallelEnv(ParallelEnv):
         if not self.agents:
             raise RuntimeError("step() called on terminated env; call reset().")
 
-        # default no-op actions
-        aA = 1
-        aB = 1
+        # Apply each agent's action to every control it owns
+        for ai in range(self.n_agents):
+            ag = f"agent_{ai}"
+            a_idx = int(actions[ag])
+            delta = int(ACTIONS[a_idx])
 
-        if self.owner_A is not None:
-            aA = int(actions[f"agent_{self.owner_A}"])
-        if self.owner_B is not None:
-            aB = int(actions[f"agent_{self.owner_B}"])
-        # if both owned by same agent and one owner missing, you still get a sensible behavior
-        if self.owner_A is None and self.owner_B is not None and self.owner_B == self.owner_A:
-            aA = aB
+            # apply to owned controls
+            for k in range(self.N):
+                if self.control_owner[k] == ai:
+                    self.prev_delta[k] = delta
+                    self.idx[k] = (self.idx[k] + delta) % len(L_SPLITS)
 
-        dA = int(ACTIONS[aA])
-        dB = int(ACTIONS[aB])
+        # Compute next loads using outputs at t+1
+        outputs_tp1 = self.G[self.t0 + self.t + 1]
+        loads_tp1 = self._compute_loads(outputs_tp1, self.idx)
 
-        self.prev_AA = int([-1, 0, 1][aA])
-        self.prev_AB = int([-1, 0, 1][aB])
-
-        self.idxA = (self.idxA + dA) % len(L_SPLITS)
-        self.idxB = (self.idxB + dB) % len(L_SPLITS)
-
-        GA_tp1 = float(self.GA[self.t0 + self.t + 1])
-        GB_tp1 = float(self.GB[self.t0 + self.t + 1])
-
-        A_L1, A_L2 = (L_SPLITS[self.idxA] / 100.0)
-        B_L2, B_L3 = (L_SPLITS[self.idxB] / 100.0)
-
-        PL1_next = A_L1 * GA_tp1
-        PL2_next = A_L2 * GA_tp1 + B_L2 * GB_tp1
-        PL3_next = B_L3 * GB_tp1
-
-        target = (GA_tp1 + GB_tp1) / 3.0
-        cost = (PL1_next - target) ** 2 + (PL2_next - target) ** 2 + (PL3_next - target) ** 2
-        reward = -float(cost) / (self.max_total ** 2)
+        total_tp1 = float(np.sum(outputs_tp1))
+        target = total_tp1 / float(self.n_lines)
+        cost = float(np.sum((loads_tp1 - target) ** 2))
+        reward = -cost / (self.max_total ** 2)
 
         self.t += 1
-        self.PL1, self.PL2, self.PL3 = PL1_next, PL2_next, PL3_next
+        self.loads = loads_tp1
 
         env_trunc = (self.t >= self.episode_len)
-
         terminations = {a: False for a in self.agents}
         truncations  = {a: env_trunc for a in self.agents}
         rewards      = {a: reward for a in self.agents}
@@ -417,6 +441,8 @@ class PowerSplitClusteredParallelEnv(ParallelEnv):
             observations = {a: self._get_obs(a) for a in self.agents}
 
         return observations, rewards, terminations, truncations, infos
+
+
 
 
 # -----------------------------
@@ -909,25 +935,42 @@ if __name__ == "__main__":
 
     # Profiles for training env
     n_steps = 250_000
-    GA_profile = discrete_random_state(n_steps + 1, start=100, low=50, high=150, step_choices=(-5, 0, 5), seed=123)
-    GB_profile = discrete_random_state(n_steps + 1, start=100, low=50, high=150, step_choices=(-10, -5, 0, 5, 10), seed=456)
+    T = n_steps + 2
 
-    # ---- 1) compute MI transition matrix on simulated transitions
-    # Use fewer steps for MI estimation if you want (faster), but can be same.
-    Z_t, S_tp1, _ = simulate_transitions(
-        n_steps=100_000,
-        GA_profile=GA_profile,
-        GB_profile=GB_profile,
-        seed=999,
-    )
-    M = compute_transition_mi_matrix(Z_t, S_tp1)
-    M = np.array([[0.7,0.7,0.3,0.3,0.3],
-         [0.7,0.7,0.7,0.3,0.3],
-         [0.3,0.7,0.7,0.3,0.3],
-         [0.7,0.7,0.3,0.7,0.3],
-         [0.3,0.7,0.7,0.3,0.7],
-         [0.7,0.7,0.3,0.7,0.3],
-         [0.3,0.7,0.7,0.3,0.7]])
+    G_profiles_8 = []
+    for i in range(8):
+        # vary step sizes a bit so generators aren't identical
+        steps = (-5, 0, 5) if i % 2 == 0 else (-10, -5, 0, 5, 10)
+        G_profiles_8.append(discrete_random_state(n_steps, start=100, low=50, high=150, step_choices=steps))
+
+    G_profiles_8 = np.stack(G_profiles_8, axis=1)  # shape (T, 8)
+ 
+    
+    M = np.array([[0.7, 0.7, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3],
+        [0.7, 0.7, 0.7, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3],
+        [0.3, 0.7, 0.7, 0.7, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3],
+        [0.3, 0.3, 0.7, 0.7, 0.7, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3],
+        [0.3, 0.3, 0.3, 0.7, 0.7, 0.7, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3],
+        [0.3, 0.3, 0.3, 0.3, 0.7, 0.7, 0.7, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3],
+        [0.3, 0.3, 0.3, 0.3, 0.3, 0.7, 0.7, 0.7, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3],
+        [0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.7, 0.7, 0.7, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3],
+        [0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.7, 0.7, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3],
+        [0.7, 0.7, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.7, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3],
+        [0.3, 0.7, 0.7, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.7, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3],
+        [0.3, 0.3, 0.7, 0.7, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.7, 0.3, 0.3, 0.3, 0.3, 0.3],
+        [0.3, 0.3, 0.3, 0.7, 0.7, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.7, 0.3, 0.3, 0.3, 0.3],
+        [0.3, 0.3, 0.3, 0.3, 0.7, 0.7, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.7, 0.3, 0.3, 0.3],
+        [0.3, 0.3, 0.3, 0.3, 0.3, 0.7, 0.7, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.7, 0.3, 0.3],
+        [0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.7, 0.7, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.7, 0.3],
+        [0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.7, 0.7, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.7],
+        [0.7, 0.7, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.7, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3],
+        [0.3, 0.7, 0.7, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.7, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3],
+        [0.3, 0.3, 0.7, 0.7, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.7, 0.3, 0.3, 0.3, 0.3, 0.3],
+        [0.3, 0.3, 0.3, 0.7, 0.7, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.7, 0.3, 0.3, 0.3, 0.3],
+        [0.3, 0.3, 0.3, 0.3, 0.7, 0.7, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.7, 0.3, 0.3, 0.3],
+        [0.3, 0.3, 0.3, 0.3, 0.3, 0.7, 0.7, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.7, 0.3, 0.3],
+        [0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.7, 0.7, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.7, 0.3],
+        [0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.7, 0.7, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.7]])
     
     alpha = 0.4
     print("MI transition matrix:\n", M)
@@ -938,10 +981,10 @@ if __name__ == "__main__":
     print("Clusters:", clusters, " -> #agents:", len(clusters))
 
     # ---- 3) build env with dynamic agents
-    env = PowerSplitClusteredParallelEnv(
-        GA_profile=GA_profile,
-        GB_profile=GB_profile,
-        clusters=merged_clusters,
+    env = PowerChainClusteredParallelEnv(
+        G_profiles=G_profiles_8,
+        clusters=merged_clusters,           # your clustering output (row indices)
+        matrix_shape=M.shape,
         episode_len=1000,
         seed=29,
         include_forecast=True,

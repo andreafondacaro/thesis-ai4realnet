@@ -1,10 +1,14 @@
 import numpy as np
+import algorithmFunctions as af
+import actionsAlgorithm as aa
+import networkx as nx
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
-import networkx as nx
+
 import time
 
-rng = np.random.default_rng(0) 
+
+rng = np.random.default_rng()
 
 
 def find_clusters(matrix):
@@ -23,9 +27,9 @@ def influence_fn(matrix, state, action):
     """
     Determines if action influences state based on matrix.
 
-    An action influences a state if matrix[state, action] == 1.
+    An action influences a state if matrix[state, action] > 0.5.
     """
-    return matrix[action, state - matrix.shape[0]] == 1
+    return matrix[action, state - matrix.shape[0]] > 0.5
 
 def _split_states_actions(cluster, n_rows, n_cols):
     """
@@ -219,8 +223,6 @@ def merge_cycles(clusters, cycles, matrix, alpha=0.6, verbose=False):
 
     return [sorted(s) for s in roots.values()]
 
-
-
 def merge_clusters(matrix, clusters, alpha):
     """
     Greedy merging of clusters:
@@ -292,7 +294,7 @@ def merge_clusters(matrix, clusters, alpha):
 
     return clusters
 
-def plot_cluster_graph(matrix, clusters, alpha, timetaken=None,
+def plot_cluster_graph(matrix, clusters, alpha, p, timetaken=None,
                        curr_matrix_name="Matrix"):
     """
     Graph view with overlapping clusters.
@@ -461,7 +463,7 @@ def plot_cluster_graph(matrix, clusters, alpha, timetaken=None,
     ax.set_title(title)
     ax.axis('off')
 
-    out_path = rf"C:\Users\andre\Desktop\Uni\Tesi\test_images\{curr_matrix_name}_alpha_{alpha}_graph_{timetaken:.2f}.png"
+    out_path = rf"C:\Users\andre\Desktop\Uni\Tesi\test_images\{curr_matrix_name}_alpha_{alpha}_p_{p}_graph_{timetaken:.2f}.png"
     plt.tight_layout()
     plt.savefig(out_path, dpi=300)
     plt.close(fig)
@@ -470,71 +472,122 @@ def plot_cluster_graph(matrix, clusters, alpha, timetaken=None,
 
 def flip_bits(M, p):
     """
-    With prob. p flips each 0→1 and 1→0 independently.
+    With prob. p flips each 0→1 and 1→0 independently,
+    then enforces:
+      1) M[i,i] = 1 for all i in diag
+      2) For rows i >= n_cols: each row has at least one 1
+      3) For each column: there is at least one 1 in rows i >= n_cols
     """
+    M = np.asarray(M)
+
     flips = rng.random(M.shape) < p
-    return np.where(flips, 1-M, M)
+    out = np.where(flips, 1 - M, M).astype(np.uint8)
+
+    n_rows, n_cols = out.shape
+    diag_n = min(n_rows, n_cols)
+
+    # 1) Force diagonal to 1
+    out[np.arange(diag_n), np.arange(diag_n)] = 1
+
+    # Define "bottom" rows as i >= n_cols (i.e., rows > matrix.shape[1] in your wording)
+    start = n_cols
+    if start < n_rows:
+        bottom = out[start:, :]  # view
+
+        # 2) Each bottom row must have at least one 1
+        row_sums = bottom.sum(axis=1)
+        zero_rows = np.where(row_sums == 0)[0]
+        if zero_rows.size > 0:
+            cols_pick = rng.integers(0, n_cols, size=zero_rows.size)
+            bottom[zero_rows, cols_pick] = 1
+
+        # 3) Each column must have at least one 1 in bottom rows
+        col_sums = bottom.sum(axis=0)
+        zero_cols = np.where(col_sums == 0)[0]
+        if zero_cols.size > 0:
+            rows_pick = rng.integers(0, bottom.shape[0], size=zero_cols.size)
+            bottom[rows_pick, zero_cols] = 1
+
+    return out
+
+
 
 def main():
-    '''matrix = np.array([[1, 1, 0, 0, 0],
-            [1, 1, 0, 0, 0],
-            [0, 0, 1, 0, 0],
-            [0, 0, 0, 1, 1],
-            [0, 0, 0, 1, 1],
-            [1, 1, 0, 0, 0],
-            [0, 0, 0, 1, 1],
-            [0, 0, 1, 0, 0],
-            [0, 0, 1, 0, 0],
-            [0, 0, 1, 0, 0],
-            [1, 1, 0, 0, 0],
-            [1, 1, 0, 0, 0],
-            [0, 0, 1, 0, 0],
-            [0, 0, 0, 1, 1],
-            [0, 0, 0, 1, 1]])
-    '''
-
-    matrix = np.array([[1, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-                        [0, 1, 0, 0, 0, 1, 0, 0, 0, 0],
-                        [0, 0, 1, 0, 0, 0, 1, 0, 0, 0],
-                        [0, 0, 0, 1, 0, 0, 0, 1, 0, 0],
-                        [1, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-                        [0, 1, 0, 0, 0, 1, 0, 0, 0, 0],
-                        [0, 0, 1, 0, 0, 0, 1, 0, 0, 0],
-                        [0, 0, 0, 1, 0, 0, 0, 1, 0, 0],
-                        [0, 0, 0, 0, 0, 0, 0, 0, 1, 1],
-                        [0, 0, 0, 0, 0, 0, 0, 0, 1, 1],
-                        [1, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-                        [0, 1, 0, 0, 0, 1, 0, 0, 0, 0],
-                        [0, 0, 1, 0, 0, 0, 1, 0, 0, 0],
-                        [0, 0, 0, 1, 0, 0, 0, 1, 0, 0],
-                        [0, 0, 0, 1, 0, 0, 0, 0, 1, 1]])
     
-    rng = np.random.default_rng(42)
+    M1 = np.array([[1, 1, 0, 0, 0],
+                   [1, 1, 0, 0, 0],
+                   [0, 0, 1, 1, 0],
+                   [0, 0, 1, 1, 0],
+                   [0, 0, 0, 0, 1],
+                   [0, 0, 0, 0, 1],
+                   [1, 1, 0, 0, 0],
+                   [1, 1, 0, 0, 0],
+                   [0, 0, 1, 1, 0],
+                   [0, 0, 0, 0, 1]])
+    
+    M2 = np.array([[1, 1, 0, 0, 0],
+                [1, 1, 0, 0, 0],
+                [0, 0, 1, 0, 0],
+                [0, 0, 0, 1, 1],
+                [0, 0, 0, 1, 1],
+                [1, 1, 0, 0, 0],
+                [0, 0, 0, 1, 1],
+                [0, 0, 1, 0, 0],
+                [0, 0, 1, 0, 0],
+                [0, 0, 1, 0, 0],
+                [1, 1, 0, 0, 0],
+                [1, 1, 0, 0, 0],
+                [0, 0, 1, 0, 0],
+                [0, 0, 0, 1, 1],
+                [0, 0, 0, 1, 1]])
+    
+    M3 = np.array([[1, 0, 0, 0, 1, 0, 0, 0, 0, 0],
+                    [0, 1, 0, 0, 0, 1, 0, 0, 0, 0],
+                    [0, 0, 1, 0, 0, 0, 1, 0, 0, 0],
+                    [0, 0, 0, 1, 0, 0, 0, 1, 0, 0],
+                    [1, 0, 0, 0, 1, 0, 0, 0, 0, 0],
+                    [0, 1, 0, 0, 0, 1, 0, 0, 0, 0],
+                    [0, 0, 1, 0, 0, 0, 1, 0, 0, 0],
+                    [0, 0, 0, 1, 0, 0, 0, 1, 0, 0],
+                    [0, 0, 0, 0, 0, 0, 0, 0, 1, 1],
+                    [0, 0, 0, 0, 0, 0, 0, 0, 1, 1],
+                    [1, 0, 0, 0, 1, 0, 0, 0, 0, 0],
+                    [0, 1, 0, 0, 0, 1, 0, 0, 0, 0],
+                    [0, 0, 1, 0, 0, 0, 1, 0, 0, 0],
+                    [0, 0, 0, 1, 0, 0, 0, 1, 0, 0],
+                    [0, 0, 0, 0, 0, 0, 0, 0, 1, 1]])
+    
+    alphas = [0.4, 0.5, 0.6, 0.7]
+    probabilities = [0.0, 0.1, 0.3, 0.5]
+    matrices = [M1, M2, M3]
+    for matrix in matrices:
+        if np.array_equal(matrix, M1):
+            curr_matrix_name = "M1"
+        elif np.array_equal(matrix, M2):
+            curr_matrix_name = "M2"
+        else:
+            curr_matrix_name = "M3"
+        for alpha in alphas:
+            for p in probabilities:
+                print(f"Analyzing matrix with alpha={alpha} and flip probability={p}")
+                noisy_matrix = flip_bits(matrix, p)
+                new_matrix = np.zeros(noisy_matrix.shape, dtype=float)
+                mask0 = (noisy_matrix == 0)
+                mask1 = (noisy_matrix == 1)
 
-    new_matrix = np.empty(matrix.shape, dtype=float)
-
-    mask0 = (matrix == 0)
-    mask1 = (matrix == 1)
-
-    new_matrix[mask0] = rng.uniform(0.0, 0.3, size=mask0.sum())
-    new_matrix[mask1] = rng.uniform(0.7, 1.0, size=mask1.sum())
-    matrix = new_matrix
-    matrix = flip_bits(matrix, 0.0)
-    start = time.perf_counter()
-    clusters = find_clusters(matrix)
-    print("Identified Clusters:")
-    for cluster in clusters:
-        print(cluster)
-    alpha = 0.2
-    merged_clusters = merge_clusters(matrix, clusters, alpha)
-    end = time.perf_counter()
-    timetaken = (end - start) * 1000
-    print("\nMerged Clusters:")
-    for cluster in merged_clusters:
-        #remove all the elements greater than matrix.shape[0]
-        cluster = [elem for elem in cluster if elem < matrix.shape[0]]
-        print(cluster)
-    plot_cluster_graph(matrix, merged_clusters, alpha=alpha, timetaken=timetaken)
+                new_matrix[mask0] = np.round(rng.uniform(0.01, 0.3, size=mask0.sum()), 3)
+                new_matrix[mask1] = np.round(rng.uniform(0.7, 1.0, size=mask1.sum()), 3)
+                print(new_matrix)
+                start = time.perf_counter()
+                clusters = find_clusters(new_matrix)
+                merged_clusters = merge_clusters(new_matrix, clusters, alpha)
+                for i in range(len(merged_clusters)):
+                    merged_clusters[i] = [elem for elem in merged_clusters[i] if elem < new_matrix.shape[0]]
+                end = time.perf_counter()
+                timetaken = (end - start) * 1000
+                print(f"Merged clusters: {merged_clusters}")
+                plot_cluster_graph(new_matrix, merged_clusters, alpha=alpha, p=p, timetaken=timetaken, curr_matrix_name=curr_matrix_name)
 
 if __name__ == "__main__":
     main()
+
